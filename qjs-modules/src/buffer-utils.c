@@ -1,0 +1,1178 @@
+#include "defines.h"
+#include "char-utils.h"
+#include "buffer-utils.h"
+#include "utils.h"
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(HAVE_TERMIOS_H)
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+#include "debug.h"
+#include <quickjs.h>
+#ifdef _WIN32
+#include "mmap-win32.h"
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#endif
+
+int JS_ToInt64Clamp(JSContext*, int64_t*, JSValueConst, int64_t, int64_t, int64_t);
+
+ssize_t
+alloc_len(uintptr_t len) {
+  return ((len + (len >> 2) + 30) + 31) & (~(uintptr_t)31);
+}
+
+/**
+ * \addtogroup buffer-utils
+ * @{
+ */
+
+int64_t
+array_search(void* a, size_t m, size_t elsz, void* needle) {
+  char* ptr = a;
+  int64_t n, ret;
+
+  n = m / elsz;
+
+  for(ret = 0; ret < n; ret++) {
+    if(!memcmp(ptr, needle, elsz))
+      return ret;
+
+    ptr += elsz;
+  }
+
+  return -1;
+}
+
+#undef js_realloc_rt
+void
+dbuf_init_ctx(JSContext* ctx, DynBuf* s) {
+  dbuf_init2(s, JS_GetRuntime(ctx), (DynBufReallocFunc*)js_realloc_rt);
+}
+
+void
+dbuf_init_rt(JSRuntime* rt, DynBuf* s) {
+  dbuf_init2(s, rt, (DynBufReallocFunc*)js_realloc_rt);
+}
+
+char*
+dbuf_at_n(const DynBuf* db, size_t i, size_t* n, char sep) {
+  size_t p, l = 0;
+
+  for(p = 0; p < db->size; ++p) {
+    if(l == i) {
+      *n = byte_chr((const char*)&db->buf[p], db->size - p, sep);
+      return (char*)&db->buf[p];
+    }
+
+    if(db->buf[p] == sep)
+      ++l;
+  }
+
+  *n = 0;
+
+  return 0;
+}
+
+const char*
+dbuf_last_line(DynBuf* db, size_t* len) {
+  size_t i;
+
+  if((i = byte_rchr(db->buf, db->size, '\n')) < db->size)
+    i++;
+  else
+    i = 0;
+
+  if(len)
+    *len = db->size - i;
+
+  return (const char*)&db->buf[i];
+}
+
+int
+dbuf_prepend(DynBuf* s, const uint8_t* data, size_t len) {
+  int ret;
+
+  if(!(ret = dbuf_reserve_start(s, len)))
+    memcpy(s->buf, data, len);
+
+  return 0;
+}
+
+void
+dbuf_put_colorstr(DynBuf* db, const char* str, const char* color, int with_color) {
+  if(with_color)
+    dbuf_putstr(db, color);
+
+  dbuf_putstr(db, str);
+
+  if(with_color)
+    dbuf_putstr(db, COLOR_NONE);
+}
+
+void
+dbuf_put_escaped_pred(DynBuf* db, const char* str, size_t len, int (*pred)(int)) {
+  size_t i = 0, j;
+  char c;
+
+  while(i < len) {
+    if((j = predicate_find(&str[i], len - i, pred))) {
+      dbuf_append(db, (const uint8_t*)&str[i], j);
+      i += j;
+    }
+
+    if(i == len)
+      break;
+
+    dbuf_putc(db, '\\');
+
+    if(str[i] == 0x1b) {
+      dbuf_append(db, (const uint8_t*)"x1b", 3);
+    } else {
+      int r = pred(str[i]);
+
+      dbuf_putc(db, (r > 1 && r <= 127) ? r : (c = escape_char_letter(str[i])) ? c : str[i]);
+
+      if(r == 'u' || r == 'x')
+        dbuf_printf(db, r == 'u' ? "%04x" : "%02x", str[i]);
+    }
+
+    i++;
+  }
+}
+
+const uint8_t escape_url_tab[256] = {
+    '%', '%', '%', '%', '%', '%',  '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%',
+    '%', '%', '%', 0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   '\\', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   '%', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   '%', '%', '%', '%', '%', '%', '%', '%',
+    '%', '%', '%', '%', '%', '%',  '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%', '%',
+};
+
+const uint8_t escape_noquote_tab[256] = {
+    'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'b',  't', 'n', 'v', 'f', 'r', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',
+    'x', 'x', 'x', 'x', 0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   '\\', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   'x', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   'u', 'u', 'u', 'u', 'u',
+    'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',  'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+};
+
+const uint8_t escape_singlequote_tab[256] = {
+    'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'b', 't', 'n', 'v',  'f',  'r', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',
+    'x', 'x', 'x', 'x', 'x', 0,   0,   0,   0,   0,   0,   0,    '\'', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,    0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   '\\', 0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,    0,    0,   0,   0,   0,   0,   0,   'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+    'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',  'u',  'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+};
+
+const uint8_t escape_doublequote_tab[256] = {
+    'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'b', 't', 'n', 'v',  'f', 'r', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',
+    'x', 'x', 'x', 'x', 'x', 0,   0,   '"', 0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   '\\', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+    'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',  'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+};
+
+const uint8_t escape_backquote_tab[256] = {
+    'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'b', 't', 0,   'v',  'f', 0,   'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',
+    'x', 'x', 'x', 'x', 'x', 0,   0,   0,   0,   '$', 0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   '\\', 0,   0,   0,   '`', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+    'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',  'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+};
+
+void
+dbuf_put_escaped_table(DynBuf* db, const char* str, size_t len, const uint8_t table[256]) {
+  size_t clen;
+  int32_t c;
+  const uint8_t *pos, *end, *next;
+
+  for(pos = (const uint8_t*)str, end = pos + len; pos < end; pos = next) {
+    uint8_t r, ch;
+
+    if((c = unicode_from_utf8(pos, end - pos, &next)) < 0)
+      break;
+
+    clen = next - pos;
+    ch = c;
+    r = (clen >= 2 || c > 0xff) ? 'u' : table[c];
+
+    if(r == 'u' && clen > 1 && (c & 0xffffff00) == 0) {
+      r = 'x';
+      // ch = c >> 8;
+    }
+
+    if(r == '%') {
+      static const char hexdigits[] = "0123456789ABCDEF";
+
+      dbuf_putc(db, '%');
+      dbuf_putc(db, hexdigits[c >> 4]);
+      dbuf_putc(db, hexdigits[c & 0xf]);
+    } else if(c == 0x1b) {
+      dbuf_putstr(db, "\\x1b");
+    } else if(r == 'u') {
+      dbuf_printf(db, c > 0xffff ? "\\u{%X}" : "\\u%04x", c);
+    } else if(r == 'x') {
+      dbuf_printf(db, "\\x%02x", ch);
+    } else if(r) {
+      dbuf_putc(db, '\\');
+      dbuf_putc(db, (r > 1 && r <= 127) ? r : (c = escape_char_letter(ch)) ? c : ch);
+    } else {
+      dbuf_put(db, pos, next - pos);
+    }
+  }
+}
+
+void
+dbuf_put_unescaped_pred(DynBuf* db, const char* str, size_t len, int (*pred)(const char*, size_t*)) {
+  size_t i = 0, j;
+  // char c;
+
+  while(i < len) {
+    int r = 0;
+
+    if((j = byte_chr(&str[i], len - i, '\\'))) {
+      dbuf_append(db, (const uint8_t*)&str[i], j);
+      i += j;
+    }
+
+    if(i == len)
+      break;
+
+    size_t n = 1;
+
+    if(pred) {
+      r = pred(&str[i + 1], &n);
+
+      if(!r && n == 1)
+        dbuf_putc(db, '\\');
+    }
+
+    if(r >= 0)
+      dbuf_putc(db, /*n > 1 ||*/ r ? /*(r > 1 && r < 256) ?*/ r : str[i]);
+
+    i += n;
+  }
+}
+
+void
+dbuf_put_unescaped_table(DynBuf* db, const char* str, size_t len, const uint8_t table[256]) {
+  size_t i = 0, j;
+  char escape_char = table == escape_url_tab ? '%' : '\\';
+
+  while(i < len) {
+    if((j = byte_chr(&str[i], len - i, escape_char))) {
+      dbuf_append(db, (const uint8_t*)&str[i], j);
+      i += j;
+    }
+
+    if(i == len)
+      break;
+
+    if(escape_char == '%') {
+      int hi = scan_fromhex(str[i + 1]), lo = scan_fromhex(str[i + 2]);
+      uint8_t c = (hi << 4) | (lo & 0xf);
+      dbuf_putc(db, c);
+
+      i += 2;
+
+    } else {
+      ++i;
+
+      uint8_t c;
+
+      switch(str[i]) {
+        case 'b': c = '\b'; break;
+        case 't': c = '\t'; break;
+        case 'n': c = '\n'; break;
+        case 'v': c = '\v'; break;
+        case 'f': c = '\f'; break;
+        case 'r': c = '\r'; break;
+        default: c = str[i]; break;
+      }
+
+      uint8_t r = table[c];
+
+      if(!(r && r != 'x' && r != 'u')) {
+        dbuf_putc(db, '\\');
+        dbuf_putc(db, c);
+      } else {
+        dbuf_putc(db, str[i] == r ? c : r);
+      }
+    }
+
+    ++i;
+  }
+}
+
+void
+dbuf_put_escaped(DynBuf* db, const char* str, size_t len) {
+  return dbuf_put_escaped_table(db, str, len, escape_noquote_tab);
+}
+
+void
+dbuf_put_value(DynBuf* db, JSContext* ctx, JSValueConst value) {
+  const char* str;
+  size_t len;
+
+  str = JS_ToCStringLen(ctx, &len, value);
+  dbuf_append(db, str, len);
+  JS_FreeCString(ctx, str);
+}
+
+void
+dbuf_put_uint32(DynBuf* db, uint32_t num) {
+  char buf[FMT_ULONG];
+
+  dbuf_put(db, (const uint8_t*)buf, fmt_ulong(buf, num));
+}
+
+void
+dbuf_put_int32(DynBuf* db, int32_t num) {
+  char buf[FMT_LONG];
+
+  dbuf_put(db, (const uint8_t*)buf, fmt_long(buf, num));
+}
+
+void
+dbuf_put_atom(DynBuf* db, JSContext* ctx, JSAtom atom) {
+  const char* str;
+
+  str = JS_AtomToCString(ctx, atom);
+  dbuf_putstr(db, str);
+  JS_FreeCString(ctx, str);
+}
+
+int
+dbuf_reserve_start(DynBuf* s, size_t len) {
+  if(unlikely((s->size + len) > s->allocated_size)) {
+    if(dbuf_realloc(s, s->size + len))
+      return -1;
+  }
+
+  if(s->size > 0)
+    memcpy(s->buf + len, s->buf, s->size);
+
+  s->size += len;
+  return 0;
+}
+
+uint8_t*
+dbuf_reserve(DynBuf* s, size_t len) {
+  if(unlikely((s->size + len) > s->allocated_size))
+    if(dbuf_realloc(s, s->size + len))
+      return 0;
+
+  return &s->buf[s->size];
+}
+
+size_t
+dbuf_token_pop(DynBuf* db, char delim) {
+  size_t n, p, len;
+  len = db->size;
+  for(n = db->size; n > 0;) {
+    if((p = byte_rchr(db->buf, n, delim)) == n) {
+      db->size = 0;
+      break;
+    }
+
+    if(p > 0 && db->buf[p - 1] == '\\') {
+      n = p - 1;
+      continue;
+    }
+
+    db->size = p;
+    break;
+  }
+
+  return len - db->size;
+}
+
+size_t
+dbuf_token_push(DynBuf* db, const char* str, size_t len, char delim) {
+  size_t pos;
+
+  if(db->size)
+    dbuf_putc(db, delim);
+
+  pos = db->size;
+  dbuf_put_escaped_pred(db, str, len, is_dot_char);
+
+  return db->size - pos;
+}
+
+JSValue
+dbuf_tostring(DynBuf* s, JSContext* ctx) {
+  return s->buf ? JS_NewStringLen(ctx, (const char*)s->buf, s->size) : JS_NULL;
+}
+
+JSValue
+dbuf_tostring_free(DynBuf* s, JSContext* ctx) {
+  JSValue r = dbuf_tostring(s, ctx);
+  dbuf_free(s);
+  return r;
+}
+
+ssize_t
+dbuf_load(DynBuf* s, const char* filename) {
+  FILE* fp;
+
+  if(!(fp = fopen(filename, "rb")))
+    return -1;
+
+  size_t nbytes = 0;
+  char buf[4096];
+  size_t r;
+
+  dbuf_reserve(s, 1);
+
+  while(!feof(fp)) {
+    if((r = fread(buf, 1, sizeof(buf), fp)) <= 0) {
+      fclose(fp);
+      return r < 0 ? -1 : nbytes;
+    }
+
+    dbuf_put(s, (uint8_t const*)buf, r);
+    nbytes += r;
+  }
+
+  fclose(fp);
+
+  return nbytes;
+}
+
+int
+dbuf_vprintf(DynBuf* s, const char* fmt, va_list ap) {
+
+  s->size += vsnprintf((char*)(s->buf + s->size), s->allocated_size - s->size, fmt, ap);
+
+  return 0;
+}
+
+size_t
+dbuf_bitflags(DynBuf* db, uint32_t bits, const char* const names[]) {
+  size_t i, n = 0;
+
+  for(i = 0; i < sizeof(bits) * 8; i++) {
+    if(bits & (1 << i)) {
+      size_t len = strlen(names[i]);
+
+      if(n) {
+        n++;
+        dbuf_putstr(db, "|");
+      }
+
+      dbuf_append(db, names[i], len);
+      n += len;
+    }
+  }
+
+  return n;
+}
+
+size_t
+dbuf_encode(DynBuf* db, int (*fn)(uint8_t*, int, unsigned int), int in) {
+  size_t max_len = db->allocated_size - db->size;
+  int w;
+
+  while((w = fn(db->buf, max_len, in) == -1)) {
+
+    if(!dbuf_reserve(db, ++max_len))
+      return -1;
+  }
+
+  db->size += w;
+  return w;
+}
+
+InputBuffer
+js_input_buffer(JSContext* ctx, JSValueConst value) {
+  InputBuffer ret = INPUTBUFFER_FREE(&inputbuffer_free_default);
+
+  if(js_is_typedarray(ctx, value))
+    ret.value = offsetlength_typedarray(&ret.range, value, ctx);
+  else if(js_is_arraybuffer(ctx, value) || js_is_sharedarraybuffer(ctx, value))
+    ret.value = JS_DupValue(ctx, value);
+
+  if(js_is_arraybuffer(ctx, ret.value) || js_is_sharedarraybuffer(ctx, ret.value)) {
+    block_from_arraybuffer(&ret.block, ret.value, ctx);
+  } else {
+    JS_ThrowTypeError(ctx, "Invalid type (%s) for input buffer", js_value_typestr(ctx, ret.value));
+    JS_FreeValue(ctx, ret.value);
+    ret.value = JS_EXCEPTION;
+  }
+
+  return ret;
+}
+
+OutputBuffer
+js_output_typedarray(JSContext* ctx, JSValueConst value) {
+  OutputBuffer ret = INPUTBUFFER_FREE(&inputbuffer_free_default);
+
+  if(js_is_typedarray(ctx, value))
+    ret.value = offsetlength_typedarray(&ret.range, value, ctx);
+
+  if(js_is_arraybuffer(ctx, ret.value) || js_is_sharedarraybuffer(ctx, ret.value)) {
+    block_from_arraybuffer(&ret.block, ret.value, ctx);
+  } else {
+    JS_ThrowTypeError(ctx, "Invalid type (%s) for output buffer", js_value_typestr(ctx, ret.value));
+    JS_FreeValue(ctx, ret.value);
+    ret.value = JS_EXCEPTION;
+  }
+
+  return ret;
+}
+
+#undef free
+
+InputBuffer
+js_input_chars(JSContext* ctx, JSValueConst value) {
+  InputBuffer ret = INPUTBUFFER_FREE(&inputbuffer_free_default);
+  BOOL is_buffer = js_is_arraybuffer(ctx, value) || js_is_sharedarraybuffer(ctx, value) || js_is_typedarray(ctx, value);
+
+  if(!is_buffer) {
+    ret.data = (uint8_t*)JS_ToCStringLen(ctx, &ret.size, value);
+    ret.value = JS_DupValue(ctx, value);
+    ret.free = &inputbuffer_free_default;
+  } else {
+    ret = js_input_buffer(ctx, value);
+  }
+
+  return ret;
+}
+
+InputBuffer
+js_input_args(JSContext* ctx, int argc, JSValueConst argv[]) {
+  InputBuffer input = js_input_chars(ctx, argv[0]);
+  BOOL is_str = JS_IsString(input.value);
+
+  if(argc > 1) {
+    js_offset_length(ctx, is_str ? utf8_strlen(input.data, input.size) : input.size, argc, argv, 1, &input.range);
+
+    if(is_str)
+      input.range = offsetlength_char2byte(input.range, input.data, input.size);
+  }
+
+  return input;
+}
+
+OutputBuffer
+js_output_args(JSContext* ctx, int argc, JSValueConst argv[]) {
+  OutputBuffer output = js_input_buffer(ctx, argv[0]);
+
+  if(argc > 1)
+    js_offset_length(ctx, output.size, argc, argv, 1, &output.range);
+
+  return output;
+}
+
+int
+block_realloc(MemoryBlock* mb, size_t new_size, JSContext* ctx) {
+  if((mb->base = js_realloc(ctx, mb->base, new_size))) {
+    mb->size = new_size;
+    return 0;
+  }
+
+  return -1;
+}
+
+void
+block_free(MemoryBlock* mb, JSRuntime* rt) {
+  if(mb->base) {
+    js_free_rt(rt, mb->base);
+    mb->base = NULL;
+  }
+}
+
+MemoryBlock
+block_mmap(const char* filename, BOOL shared) {
+  int fd;
+  MemoryBlock mb = BLOCK_INIT();
+
+  if((fd = open(filename, O_RDONLY)) != -1) {
+    struct stat st;
+
+    if(fstat(fd, &st) != -1) {
+      mb.size = st.st_size;
+      if((mb.base = mmap(0, mb.size, PROT_READ, shared ? MAP_SHARED : MAP_PRIVATE, fd, 0)) == (void*)-1)
+        mb.base = 0;
+    }
+    close(fd);
+  }
+
+  return mb;
+}
+
+void
+block_munmap(MemoryBlock* mb) {
+  munmap(mb->base, mb->size);
+  mb->base = 0;
+  mb->size = 0;
+}
+
+int
+block_from_file(MemoryBlock* mb, const char* filename, JSContext* ctx) {
+  int fd;
+  void* ptr;
+  struct stat st;
+
+  if((fd = open(filename, O_RDONLY)) == -1)
+    return -1;
+
+  if(fstat(fd, &st) == -1) {
+    close(fd);
+    return -1;
+  }
+
+  if((ptr = js_malloc(ctx, st.st_size))) {
+    if(read(fd, ptr, st.st_size) != st.st_size) {
+      free(ptr);
+      close(fd);
+      return -1;
+    }
+
+    close(fd);
+
+    mb->base = ptr;
+    mb->size = st.st_size;
+    return 0;
+  }
+
+  return -1;
+}
+
+MemoryBlock
+block_file(const char* filename, JSContext* ctx) {
+  MemoryBlock mb = BLOCK_INIT();
+  block_from_file(&mb, filename, ctx);
+  return mb;
+}
+
+int
+offsetlength_from_argv(OffsetLength* ol, int64_t size, int argc, JSValueConst argv[], JSContext* ctx) {
+  int64_t tmp;
+  int i = 0;
+
+  ol->offset = 0;
+  ol->length = size;
+
+  if(i < argc) {
+    if(!js_is_null_or_undefined(argv[i])) {
+      tmp = 0;
+
+      if(JS_ToInt64Ext(ctx, &tmp, argv[i]))
+        return -1;
+
+      if((tmp + size) < 0 || tmp > size) {
+        JS_ThrowRangeError(ctx, "offset argument %" PRId64 " out of range (size is %" PRId64 ")", tmp, size);
+        return -1;
+      }
+
+      /* if argument is negative, it counts from the end */
+      if(tmp < 0)
+        tmp += size;
+
+      ol->offset += tmp;
+      ol->length -= tmp;
+    }
+
+    i++;
+
+    if(i < argc) {
+      tmp = ol->length;
+
+      if(!js_is_null_or_undefined(argv[i])) {
+        if(JS_ToInt64Ext(ctx, &tmp, argv[i]))
+          return -2;
+
+        /* if argument is negative, it indicates the end position, not a length */
+        if(tmp < 0)
+          tmp += size - ol->offset;
+
+        if(tmp < 0 /*|| tmp > ol->length*/) {
+          JS_ThrowRangeError(ctx, "length argument %" PRId64 " out of range (offset is %" PRId64 ", size is %" PRId64 ")", tmp, ol->offset, size);
+          return -1;
+        }
+
+        ol->length = MIN_NUM(tmp, ol->length);
+      }
+
+      i++;
+    }
+  }
+
+  return i;
+}
+
+OffsetLength
+offsetlength_char2byte(OffsetLength ol, const void* x, size_t len) {
+  const uint8_t* buf = x;
+  size_t offset = ol.offset > 0 ? len > 0 ? utf8_byteoffset(buf, len, ol.offset) : 0 : ol.offset;
+
+  if(offset > 0) {
+    buf += offset;
+    len -= offset;
+  }
+
+  size_t length = ol.length > 0 ? len > 0 ? utf8_byteoffset(buf, len, ol.length) : 0 : ol.length;
+  return (OffsetLength){offset, length};
+}
+
+OffsetLength
+offsetlength_byte2char(OffsetLength ol, const void* x, size_t len) {
+  const uint8_t* buf = x;
+
+  size_t offset = ol.offset > 0 ? len > 0 ? utf8_strlen(buf, MIN_NUM(len, ol.offset)) : 0 : ol.offset;
+
+  if(ol.offset > 0) {
+    buf += ol.offset;
+    len -= ol.offset;
+  }
+
+  size_t length = ol.length > 0 ? len > 0 ? utf8_strlen(buf, MIN_NUM(len, ol.length)) : 0 : ol.length;
+  return (OffsetLength){offset, length};
+}
+
+JSValue
+offsetlength_typedarray(OffsetLength* ol, JSValueConst array, JSContext* ctx) {
+  JSValue ret;
+  size_t offset, length;
+
+  ret = JS_GetTypedArrayBuffer(ctx, array, &offset, &length, NULL);
+
+  if(!JS_IsException(ret)) {
+    ol->offset = offset;
+    ol->length = length;
+  }
+
+  return ret;
+}
+
+int
+range_overlap(PointerRange a, PointerRange b) {
+  return range_in(a, b.start) || range_in(a, b.end);
+}
+
+PointerRange
+range_null() {
+  return (PointerRange){0, 0};
+}
+
+PointerRange
+range_from_buf(const void* x, uintptr_t n) {
+  return (PointerRange){(char*)x, (char*)x + n};
+}
+
+PointerRange
+range_from_str(const char* s) {
+  return range_from_buf(s, strlen(s));
+}
+
+int
+range_resize(PointerRange* r, uintptr_t newlen) {
+  uintptr_t len = range_size(*r);
+
+  if(newlen > len) {
+    uintptr_t res = alloc_len(len + 1);
+
+    if(newlen < res)
+      return -1;
+  }
+
+  r->end = r->start + newlen;
+  *(char*)r->end = '\0';
+  return 0;
+}
+
+int
+range_write(PointerRange* r, const void* x, uintptr_t n) {
+  ssize_t len = range_size(*r);
+  ssize_t a = alloc_len(len + n + 1);
+
+  if(!r->start || a != alloc_len(len + 1))
+    if(!(r->start = realloc(r->start, a)))
+      return -1;
+
+  byte_copy(range_begin(*r) + len, n, x);
+  r->end = r->start + len + n;
+  *(char*)r->end = '\0';
+
+  return 0;
+}
+
+int
+range_puts(PointerRange* r, const void* x) {
+  return range_write(r, x, strlen(x));
+}
+
+int
+range_append(PointerRange* r, PointerRange other) {
+  return range_write(r, other.start, range_size(other));
+}
+
+int
+inputbuffer_from_argv(InputBuffer* in, int argc, JSValueConst argv[], JSContext* ctx) {
+  int ret = 0;
+
+  if(argc > 0) {
+    *in = js_input_chars(ctx, argv[0]);
+    ret += 1;
+
+    if(ret < argc)
+      ret += js_offset_length(ctx, in->size, argc, argv, ret, &in->range);
+  }
+
+  return ret;
+}
+
+BOOL
+inputbuffer_valid(const InputBuffer* in) {
+  return !JS_IsException(in->value);
+}
+
+void
+inputbuffer_clone2(InputBuffer* dst, const InputBuffer* src, JSContext* ctx) {
+  inputbuffer_free(dst, ctx);
+
+  dst->block = src->block;
+  dst->pos = src->pos;
+  dst->free = src->free;
+  dst->value = JS_DupValue(ctx, src->value);
+  dst->range = src->range;
+}
+
+InputBuffer
+inputbuffer_clone(const InputBuffer* in, JSContext* ctx) {
+  InputBuffer ret = INPUTBUFFER();
+
+  inputbuffer_clone2(&ret, in, ctx);
+
+  return ret;
+}
+
+void
+inputbuffer_dump(const InputBuffer* in, DynBuf* db) {
+  dbuf_printf(db, "(InputBuffer){ .data = %p, .size = %lu, .pos = %lu, .free = %p }", in->data, (unsigned long)in->size, (unsigned long)in->pos, in->free);
+}
+
+void
+inputbuffer_free(InputBuffer* in, JSContext* ctx) {
+  if(in->data) {
+    in->free(ctx, in->value, in);
+    in->data = 0;
+    in->size = 0;
+    in->pos = 0;
+    in->value = JS_UNDEFINED;
+  }
+}
+
+const void*
+inputbuffer_peek(InputBuffer* in, size_t* lenp) {
+  inputbuffer_peekc(in, lenp);
+  return inputbuffer_pointer(in);
+}
+
+const void*
+inputbuffer_get(InputBuffer* in, size_t* lenp) {
+  const uint8_t* ret = inputbuffer_peek(in, lenp);
+
+  in->pos += *lenp;
+
+  return ret;
+}
+
+const char*
+inputbuffer_currentline(InputBuffer* in, size_t* len) {
+  size_t i;
+
+  if((i = byte_rchr(inputbuffer_data(in), in->pos, '\n')) < in->pos)
+    i++;
+
+  if(len)
+    *len = in->pos - i;
+
+  return (const char*)&inputbuffer_begin(in)[i];
+}
+
+size_t
+inputbuffer_column(InputBuffer* in, size_t* len) {
+  size_t i;
+
+  if((i = byte_rchr(inputbuffer_data(in), in->pos, '\n')) < in->pos)
+    i++;
+
+  return in->pos - i;
+}
+
+JSValue
+inputbuffer_tostring_free(InputBuffer* in, JSContext* ctx) {
+  JSValue ret = in->data ? JS_NewStringLen(ctx, inputbuffer_data(in), inputbuffer_length(in)) : JS_UNDEFINED;
+  inputbuffer_free(in, ctx);
+  return ret;
+}
+
+JSValue
+inputbuffer_toarraybuffer_free(InputBuffer* in, JSContext* ctx) {
+  if(!in->data)
+    return JS_UNDEFINED;
+
+  JSValue ret;
+
+  if(in->free == inputbuffer_free_default && js_is_arraybuffer(ctx, in->value))
+    ret = in->value;
+  else
+    ret = JS_NewArrayBuffer(
+        ctx, (uint8_t*)inputbuffer_data(in), inputbuffer_length(in), (JSFreeArrayBufferDataFunc*)&js_freeobj_rt, js_value_obj(in->value), FALSE);
+
+  in->data = 0;
+  in->size = 0;
+  in->value = JS_UNINITIALIZED;
+
+  inputbuffer_free(in, ctx);
+  return ret;
+}
+
+InputBuffer
+inputbuffer_file(const char* filename, JSContext* ctx) {
+  InputBuffer in = INPUTBUFFER();
+
+  in.value = js_arraybuffer_mmap(ctx, filename, FALSE);
+
+  if(!JS_IsException(in.value))
+    in.data = JS_GetArrayBuffer(ctx, &in.size, in.value);
+
+  return in;
+}
+
+ssize_t
+inputbuffer_read(InputBuffer* ib, void* buf, size_t len) {
+  size_t remain = inputbuffer_remain(ib);
+
+  if(len > remain)
+    len = remain;
+
+  if(len)
+    memcpy(buf, inputbuffer_pointer(ib), len);
+
+  ib->pos += len;
+  return len;
+}
+
+size_t
+inputbuffer_decode(InputBuffer* in, int (*fn)(const uint8_t*, int, void*), void* out) {
+  const uint8_t *ptr = inputbuffer_pointer(in), *next = ptr;
+
+  int len = fn(ptr, inputbuffer_remain(in), out);
+
+  if(len >= 0) {
+    in->pos += len;
+    return len;
+  }
+
+  return 0;
+}
+
+size_t
+outputbuffer_encode(OutputBuffer* out, int (*fn)(uint8_t*, int, unsigned int), int in) {
+  int w;
+
+  if((w = fn(outputbuffer_pointer(out), outputbuffer_avail(out), in)) != -1)
+    out->pos += w;
+
+  return w >= 0 ? w : 0;
+}
+
+ssize_t
+outputbuffer_write(OutputBuffer* out, const void* ptr, size_t len) {
+  size_t n = outputbuffer_avail(out);
+
+  if(len > n)
+    return -1;
+
+  memcpy(outputbuffer_pointer(out), ptr, len);
+  out->pos += len;
+  return len;
+}
+
+ssize_t
+outputbuffer_append(OutputBuffer* out, const void* ptr, size_t len, JSContext* ctx) {
+  if(outputbuffer_avail(out) < len)
+    if(!ctx || outputbuffer_reserve(out, len, ctx))
+      return -1;
+
+  memcpy(outputbuffer_pointer(out), ptr, len);
+  out->pos += len;
+  return len;
+}
+
+int
+indexrange_from_argv(IndexRange* ir, int64_t size, int argc, JSValueConst argv[], JSContext* ctx) {
+  int i = 0;
+
+  ir->arr[0] = 0;
+  ir->arr[1] = size;
+
+  if(i < argc) {
+    if(JS_ToInt64Clamp(ctx, &ir->arr[0], argv[i], 0, size, size))
+      return -1;
+
+    if(++i < argc) {
+      if(JS_ToInt64Clamp(ctx, &ir->arr[1], argv[i], ir->arr[0], size, size))
+        return -2;
+
+      ++i;
+    }
+  }
+
+  return i;
+}
+
+inline int
+inputbuffer_peekc(InputBuffer* in, size_t* lenp) {
+  const uint8_t *ptr, *next;
+  int cp;
+
+  next = ptr = inputbuffer_pointer(in);
+  cp = unicode_from_utf8(ptr, inputbuffer_remain(in), &next);
+
+  *lenp = next - ptr;
+
+  return cp;
+}
+
+int
+outputbuffer_reserve(OutputBuffer* out, size_t len, JSContext* ctx) {
+  uint8_t *end = block_end(out->block), *newend = outputbuffer_pointer(out) + len;
+
+  if(newend > end)
+    if(!block_grow(&out->block, newend - end, ctx))
+      return -1;
+
+  out->range.length = end - outputbuffer_begin(out);
+
+  return 0;
+}
+
+int
+outputbuffer_putc(OutputBuffer* out, unsigned int c, JSContext* ctx) {
+  int len = unicode_len_utf8(c);
+
+  if(outputbuffer_avail(out) < len)
+    if(!ctx || outputbuffer_reserve(out, len, ctx))
+      return -1;
+
+  unicode_to_utf8(outputbuffer_pointer(out), c);
+  out->pos += len;
+  return len;
+}
+
+int
+uint16_decode_le(const uint8_t* p, int max_len, void* out) {
+  if(max_len >= 2) {
+    *(uint16_t*)out = uint16_get_le(p);
+    return 2;
+  }
+  return 0;
+}
+
+int
+uint16_decode_be(const uint8_t* p, int max_len, void* out) {
+  if(max_len >= 2) {
+    *(uint16_t*)out = uint16_get_be(p);
+    return 2;
+  }
+  return 0;
+}
+
+int
+uint32_decode_le(const uint8_t* p, int max_len, void* out) {
+  if(max_len >= 4) {
+    *(uint32_t*)out = uint32_get_le(p);
+    return 4;
+  }
+  return 0;
+}
+
+int
+uint32_decode_be(const uint8_t* p, int max_len, void* out) {
+  if(max_len >= 4) {
+    *(uint32_t*)out = uint32_get_be(p);
+    return 4;
+  }
+  return 0;
+}
+
+int
+unicode_decode_utf8(const uint8_t* buf, int max_len, void* out) {
+  const uint8_t* next = buf;
+  int c = unicode_from_utf8(buf, max_len, &next);
+
+  if(next > buf) {
+    *((int*)out) = c;
+    return next - buf;
+  }
+
+  return -1;
+}
+int
+unicode_encode_utf8(uint8_t* buf, int max_len, unsigned int c) {
+  int len = unicode_len_utf8(c);
+  if(len > 0 && len <= max_len)
+    return unicode_to_utf8(buf, c);
+  return len;
+}
+
+int
+uint16_encode_le(uint8_t* buf, int max_len, unsigned int u) {
+  if(max_len >= 2) {
+    uint16_put_le(buf, u);
+    return 2;
+  }
+  return -1;
+}
+
+int
+uint16_encode_be(uint8_t* buf, int max_len, unsigned int u) {
+  if(max_len >= 2) {
+    uint16_put_be(buf, u);
+    return 2;
+  }
+  return -1;
+}
+
+int
+uint32_encode_le(uint8_t* buf, int max_len, unsigned int u) {
+  if(max_len >= 4) {
+    uint32_put_le(buf, u);
+    return 4;
+  }
+  return -1;
+}
+
+int
+uint32_encode_be(uint8_t* buf, int max_len, unsigned int u) {
+  if(max_len >= 4) {
+    uint32_put_be(buf, u);
+    return 4;
+  }
+  return -1;
+}
+
+/**
+ * @}
+ */
